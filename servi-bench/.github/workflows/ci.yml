@@ -1,0 +1,169 @@
+name: Unit and integration testing
+
+on: [push]
+
+env:
+  IMAGE_NAME: localhost:5000/perfkit/serverless-benchmarker:ci
+  REGISTRY_PATH: ${{ github.workspace }}/registry
+  CACHE_PATH: /tmp/.buildx-cache
+  # Available Python versions:
+  # * Dockerhub: https://hub.docker.com/_/python
+  # * GH Actions: https://github.com/actions/python-versions/releases
+  PYTHON_VERSION: 3.8.6
+
+# Running a local Docker registry in the build job and share the volume
+# of this registry as an artifact to the test job.
+# Inspired by this discussion in the Github community:
+# https://github.community/t/whats-the-recommended-way-to-pass-a-docker-image-to-the-next-job-in-a-workflow/17225/15
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Start Docker registry
+        run: docker run -d -p 5000:5000 -v ${REGISTRY_PATH}:/var/lib/registry --name registry registry:2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+        with:
+          driver-opts: network=host
+
+      - name: Cache Docker layers
+        uses: actions/cache@v2
+        with:
+          path: ${{ env.CACHE_PATH }}
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: ${{ runner.os }}-buildx-
+
+      - name: Build docker image
+        uses: docker/build-push-action@v2
+        with:
+          context: .
+          file: ./Dockerfile
+          cache-from: type=local,src=${{ env.CACHE_PATH }}
+          cache-to: type=local,dest=${{ env.CACHE_PATH }}
+          push: true
+          tags: ${{ env.IMAGE_NAME }}
+          build-args: PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+
+      - name: Stop Docker registry
+        run: docker stop registry
+
+      - name: Upload Docker registry data for testing
+        uses: actions/upload-artifact@v2
+        with:
+          name: docker-registry-data
+          path: ${{ env.REGISTRY_PATH }}/
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      DOCKER_CLI_EXPERIMENTAL: enabled
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Download Docker registry data from build job
+        uses: actions/download-artifact@v2
+        with:
+          name: docker-registry-data
+          path: ${{ env.REGISTRY_PATH }}
+
+      - name: Enable Docker experimental
+        run: |
+          # Enable docker daemon experimental support.
+          echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: Start Docker registry
+        run: |
+          docker run -d -p 5000:5000 -v ${REGISTRY_PATH}:/var/lib/registry --name registry registry:2
+          sleep 1
+
+      - name: Import Docker image
+        run: |
+          docker pull ${IMAGE_NAME} \
+          && docker tag ${IMAGE_NAME} serverless-benchmarker
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          make install
+
+      - name: Lint with flake8
+        run: make lint
+
+      - name: Unit test with pytest
+        run: make unit_test
+
+      - name: Integration test with pytest
+        run: make integration_test
+
+      - name: Discard large build artifacts (~150MB+)
+        if: ${{ always() }}
+        uses: geekyeggo/delete-artifact@v1
+        with:
+          name: docker-registry-data
+
+# This workaround only works if the integration tests are 
+# executed in debug mode, which makes local development cumbersome
+# because it would require re-building the Dockerfile after each code change.
+  # # Workaround for initial sb invocation in Docker container
+  # # because sb tries to mount /sb without knowing the host context.
+  # # This hack allows to run sb when its debug mode is disabled
+  # # (installing dependencies would support debug mode too)
+  # test_docker:
+  #   runs-on: ubuntu-latest
+  #   needs: build
+  #   env:
+  #     DOCKER_CLI_EXPERIMENTAL: enabled
+  #   steps:
+  #     - uses: actions/checkout@v2
+
+  #     - name: Create same symlink on Docker host as in container
+  #       run: echo ${{secrets.DEPLOY_PASSWORD}} | sudo -S ln -s $GITHUB_WORKSPACE /sb
+
+  #     - name: Download Docker registry data from build job
+  #       uses: actions/download-artifact@v2
+  #       with:
+  #         name: docker-registry-data
+  #         path: ${{ env.REGISTRY_PATH }}
+
+  #     - name: Enable Docker experimental
+  #       run: |
+  #         # Enable docker daemon experimental support.
+  #         echo '{"experimental": true}' | sudo tee /etc/docker/daemon.json
+  #         sudo systemctl restart docker
+
+  #     - name: Start Docker registry
+  #       run: |
+  #         docker run -d -p 5000:5000 -v ${REGISTRY_PATH}:/var/lib/registry --name registry registry:2
+  #         sleep 1
+
+  #     - name: Import Docker image
+  #       run: |
+  #         docker pull ${IMAGE_NAME} \
+  #         && docker tag ${IMAGE_NAME} serverless-benchmarker
+
+  #     - name: Install test dependencies
+  #       run: |
+  #         docker run --name sb-dev ${IMAGE_NAME} make install \
+  #         && docker commit sb-dev sb-dev
+
+  #     - name: Unit test with pytest
+  #       run: docker run --rm sb-dev make unit_test
+
+  #     - name: Integration test with pytest
+  #       run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock sb-dev make integration_test
+
+  #     # - name: Discard large build artifacts (~150MB+)
+  #     #   if: ${{ always() }}
+  #     #   uses: geekyeggo/delete-artifact@v1
+  #     #   with:
+  #     #     name: docker-registry-data
